@@ -201,8 +201,8 @@ def main() -> None:
         "batch_size": chunk_size,
         "mode": args.mode,
         "schedule_mode": "burst" if args.burst else "paced",
-        "run_elapsed_seconds": round(elapsed, 3),
-        "measured_burst_seconds": round(burst_seconds, 3),
+        "run_elapsed_seconds": elapsed,
+        "measured_burst_seconds": burst_seconds,
         "accepted_readings_per_second": round(counts["accepted"] / burst_seconds, 2) if burst_seconds else 0,
         "request_latency_ms": {
             "p50": round(_percentile(request_latencies, 0.50), 2) if request_latencies else None,
