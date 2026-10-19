@@ -6,8 +6,8 @@ from app.config import get_settings
 engine = create_engine(
     get_settings().database_url,
     pool_pre_ping=True,
-    pool_size=5,
-    max_overflow=5,
+    pool_size=10,
+    max_overflow=10,
 )
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
