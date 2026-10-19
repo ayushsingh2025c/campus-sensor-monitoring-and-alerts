@@ -1,0 +1,127 @@
+import argparse
+import json
+import random
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import UTC, datetime
+from math import ceil
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+from uuid import uuid4
+
+
+def generate_readings(
+    count: int,
+    *,
+    sensor_count: int,
+    metric_types: list[str],
+    breach_every: int,
+    seed: int,
+) -> list[dict[str, Any]]:
+    rng = random.Random(seed)
+    generated_at = datetime.now(UTC).isoformat()
+    return [
+        {
+            "eventId": str(uuid4()),
+            "sensorId": f"sim-{index % sensor_count:05d}",
+            "type": metric_types[index % len(metric_types)],
+            "value": 100 if breach_every and (index + 1) % breach_every == 0 else round(rng.uniform(15, 25), 3),
+            "timestamp": generated_at,
+            "metadata": {"source": "simulator", "sequence": index},
+        }
+        for index in range(count)
+    ]
+
+
+def _chunks(items: list[dict[str, Any]], size: int) -> list[list[dict[str, Any]]]:
+    return [items[start : start + size] for start in range(0, len(items), size)]
+
+
+def _submit(base_url: str, items: list[dict[str, Any]], mode: str, scheduled_at: float) -> dict[str, int]:
+    delay = scheduled_at - time.monotonic()
+    if delay > 0:
+        time.sleep(delay)
+    endpoint = "/api/v1/readings" if mode == "individual" else "/api/v1/readings/batch"
+    body: object = items[0] if mode == "individual" else {"readings": items}
+    request = Request(
+        f"{base_url.rstrip('/')}{endpoint}",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            result = json.loads(response.read())
+            if mode == "individual":
+                key = "duplicate" if result.get("status") == "duplicate" else "accepted"
+                return {key: 1}
+            counts = {"accepted": 0, "duplicate": 0, "rejected": 0}
+            for outcome in result.get("results", []):
+                counts[outcome.get("status", "rejected")] += 1
+            return counts
+    except HTTPError as exc:
+        if exc.code == 207:
+            result = json.loads(exc.read())
+            counts = {"accepted": 0, "duplicate": 0, "rejected": 0}
+            for outcome in result.get("results", []):
+                counts[outcome.get("status", "rejected")] += 1
+            return counts
+        return {"failed": len(items)}
+    except (TimeoutError, URLError, OSError, json.JSONDecodeError):
+        return {"failed": len(items)}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Generate campus sensor readings for the API")
+    parser.add_argument("--base-url", default="http://127.0.0.1:8000")
+    parser.add_argument("--sensors", type=int, default=100)
+    parser.add_argument("--types", default="temperature,humidity")
+    parser.add_argument("--rate", type=float, default=100, help="Target readings per second")
+    parser.add_argument("--duration", type=float, default=10, help="Run duration in seconds")
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--mode", choices=("individual", "batch"), default="individual")
+    parser.add_argument("--breach-every", type=int, default=10, help="Set every Nth reading to 100; 0 disables")
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=32)
+    args = parser.parse_args()
+    if args.sensors < 1 or args.rate <= 0 or args.duration <= 0 or args.batch_size < 1 or args.workers < 1:
+        parser.error("sensors, rate, duration, batch-size, and workers must be positive")
+    if args.breach_every < 0:
+        parser.error("breach-every must be nonnegative")
+    metric_types = [value.strip() for value in args.types.split(",") if value.strip()]
+    if not metric_types:
+        parser.error("types must include at least one metric type")
+
+    target_count = max(1, ceil(args.rate * args.duration))
+    readings = generate_readings(
+        target_count,
+        sensor_count=args.sensors,
+        metric_types=metric_types,
+        breach_every=args.breach_every,
+        seed=args.seed,
+    )
+    chunk_size = 1 if args.mode == "individual" else args.batch_size
+    jobs = _chunks(readings, chunk_size)
+    started = time.monotonic()
+    counts = {"attempted": target_count, "accepted": 0, "duplicate": 0, "rejected": 0, "failed": 0}
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = [
+            executor.submit(
+                _submit,
+                args.base_url,
+                items,
+                args.mode,
+                started + index * chunk_size / args.rate,
+            )
+            for index, items in enumerate(jobs)
+        ]
+        for future in as_completed(futures):
+            for key, value in future.result().items():
+                counts[key] = counts.get(key, 0) + value
+    elapsed = time.monotonic() - started
+    print(json.dumps({**counts, "elapsed_seconds": round(elapsed, 3), "achieved_readings_per_second": round(target_count / elapsed, 2)}, indent=2))
+
+
+if __name__ == "__main__":
+    main()

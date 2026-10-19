@@ -1,0 +1,1 @@
+"""Campus sensor monitoring service."""

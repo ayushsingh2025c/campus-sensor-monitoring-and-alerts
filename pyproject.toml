@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "campus-sensor-monitor"
+version = "0.1.0"
+description = "Campus sensor monitoring and alerting backend"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "alembic==1.20.0",
+    "fastapi==0.148.0",
+    "psycopg[binary]==3.3.6",
+    "pydantic==2.14.1",
+    "pydantic-settings==2.16.0",
+    "redis==8.1.0",
+    "sqlalchemy==2.1.5",
+    "uvicorn[standard]==0.54.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx==0.28.1",
+    "locust==2.46.7",
+    "pytest==9.1.1",
+]
+
+[project.scripts]
+campus-worker = "app.worker:main"
+campus-smoke = "app.smoke_test:main"
+campus-simulator = "app.simulator:main"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
