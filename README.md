@@ -1,64 +1,18 @@
 # Campus Sensor Monitoring and Alerts
 
-Backend foundation for the agreed Python/FastAPI, PostgreSQL, SQLAlchemy/Alembic, Redis Streams, and Python worker stack. Phase 1 decisions and endpoint/schema contracts are in `docs\phase-1-design.md`, `docs\api-specification.md`, `docs\database-schema.md`, and `docs\acceptance-checklist.md`.
+Backend using the agreed Python, FastAPI, PostgreSQL, SQLAlchemy/Alembic, Redis Streams, and Python worker stack. Phase 1 decisions and contracts are in `docs/phase-1-design.md`, `docs/api-specification.md`, `docs/database-schema.md`, and `docs/acceptance-checklist.md`.
 
-## Local prerequisites
+## Prerequisites
 
-- Python 3.14+
-- The existing PostgreSQL 18 Windows service, with an administrator able to create a local application role and database
-- WSL2 with Ubuntu and Redis 5.0+ (Streams required); run Redis with AOF enabled for durable ingestion
-- No Docker installation is needed for this local path. Docker Compose remains the agreed reproducible deployment option.
+- Python 3.14 or newer
+- PostgreSQL 18 (or a compatible supported PostgreSQL release), including the `psql` client for the database commands below
+- Redis 5 or newer (Redis Streams required); use Redis 6.2+ if relying on `XAUTOCLAIM`, although this worker uses `XPENDING`/`XCLAIM`
+- Git
+- Docker is not required for the local setup below; Docker Compose remains an option for a future reproducible service bundle.
 
-The PostgreSQL database `sensor_monitoring` is configured in `.env`, and Alembic revision `0001_initial` has been applied. Ensure the PostgreSQL command-line tools are installed and available on `PATH`.
+The application uses PostgreSQL for durable readings/rules/alerts and Redis Streams as the durable ingestion boundary. Run Redis with AOF enabled and `appendfsync always` for this local configuration.
 
-### Prepare PostgreSQL
-
-Have a PostgreSQL administrator connect locally (the following prompts for the administrator password):
-
-```powershell
-psql -h 127.0.0.1 -U postgres -d postgres -W
-```
-
-At the `psql` prompt, create a dedicated least-privilege application login and database, substituting a strong local password, only if they do not already exist:
-
-```sql
-CREATE ROLE sensor_app LOGIN PASSWORD 'replace-with-a-strong-local-password';
-CREATE DATABASE sensor_monitoring OWNER sensor_app;
-```
-
-Use that role and password in `.env`. URL-encode special characters in the password. Do not commit `.env`.
-
-### Prepare Redis in WSL Ubuntu
-
-The current `localhost:6379` endpoint reports Redis-compatible version `3.0.504`, which does not support Streams. A Redis 5+ server is required. Redis is not installed as a system service in WSL Ubuntu, and installing it requires interactive `sudo` authorization:
-
-For this workspace, Redis 8.0.5 has been unpacked from the official Ubuntu package repository under the ignored `.tools\redis` directory. Start that local copy without system installation:
-
-```powershell
-$repo = (Get-Location).Path
-$wslRepo = (wsl -d Ubuntu -- wslpath -a "$repo").Trim()
-$redisRoot = "$wslRepo/.tools/redis/root"
-$redisData = "$wslRepo/.tools/redis/data"
-wsl -d Ubuntu -- sh -lc "mkdir -p '$redisData' && LD_LIBRARY_PATH='$redisRoot/usr/lib/x86_64-linux-gnu' '$redisRoot/usr/bin/redis-server' --bind 127.0.0.1 --port 6380 --protected-mode yes --appendonly yes --appendfsync always --dir '$redisData' --daemonize yes --pidfile '$redisData/redis.pid' --logfile '$redisData/redis.log'"
-```
-
-If `.tools\redis` is not present in a fresh checkout, install the system package using the commands below.
-
-```bash
-sudo apt-get update
-sudo apt-get install redis-server
-redis-server --bind 127.0.0.1 --port 6380 --appendonly yes --appendfsync always
-```
-
-Keep Redis running in that terminal. AOF with `appendfsync always` is the configured ingestion durability boundary. From Windows, verify Redis Streams support before starting the API or worker:
-
-```bash
-redis-cli INFO server | grep redis_version
-redis-cli CONFIG GET appendonly
-redis-cli CONFIG GET appendfsync
-```
-
-## Install and run
+## Fresh checkout and Python environment
 
 From the repository root in PowerShell:
 
@@ -67,59 +21,139 @@ py -3.14 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -e '.[dev]'
-Copy-Item .env.example .env
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 ```
 
-Edit `.env` with your local PostgreSQL credentials (the current local `.env` already targets `sensor_monitoring`). Apply the schema:
+Keep `.env` local and never commit it. Configure `DATABASE_URL` for your PostgreSQL instance. The example uses `sensor_app` / `replace-me` as placeholders; replace them locally and URL-encode special characters in the password. `REDIS_URL` defaults to `redis://127.0.0.1:6380/0`; change it if your Redis Streams server uses a different address. The remaining `REDIS_*` variables configure the stream, consumer group, consumer name, blocking interval, and pending-message reclaim timeout.
+
+## PostgreSQL database and migrations
+
+Create a dedicated application login and database as a PostgreSQL administrator. At a local `psql` prompt, substitute a strong local password:
+
+```powershell
+psql -h 127.0.0.1 -U postgres -d postgres -W
+```
+
+```sql
+CREATE ROLE sensor_app LOGIN PASSWORD 'replace-with-a-strong-local-password';
+CREATE DATABASE sensor_monitoring OWNER sensor_app;
+```
+
+If the role/database already exist, reuse them rather than recreating them. Set `DATABASE_URL` in `.env` to that database and role, then apply or check migrations:
 
 ```powershell
 python -m alembic upgrade head
+python -m alembic current
 ```
 
-In separate PowerShell terminals, start the worker and API:
+The initial migration is `0001_initial`. Migrations only target the database selected by `DATABASE_URL`.
 
-```powershell
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
-python -m app.worker
+## Redis Streams
+
+Run a Redis server that supports Streams. For WSL Ubuntu, an administrator may install the packaged service with:
+
+```bash
+sudo apt-get update
+sudo apt-get install redis-server
+redis-server --bind 127.0.0.1 --port 6380 --appendonly yes --appendfsync always
 ```
 
-Because the existing server uses port 6379, the Redis Streams server above uses port 6380. Set this environment variable in each PowerShell terminal used to run the API, worker, simulator, or smoke test (it overrides `REDIS_URL` in `.env`):
+WSL2 localhost forwarding allows Windows clients to reach the loopback-bound Redis server. If the legacy Redis-compatible endpoint on port 6379 does not support Streams, keep the Streams server on port 6380 and set in each PowerShell terminal:
 
 ```powershell
 $env:REDIS_URL = 'redis://127.0.0.1:6380/0'
 ```
 
-`GET http://127.0.0.1:8000/health` returns `200` only when PostgreSQL responds and the Redis server supports Streams. With Redis and the worker running, publish a test event and verify that the separate worker consumes, commits, and persists it:
+Verify the Redis version and persistence configuration from a Redis CLI:
+
+```bash
+redis-cli -p 6380 INFO server | grep redis_version
+redis-cli -p 6380 CONFIG GET appendonly
+redis-cli -p 6380 CONFIG GET appendfsync
+```
+
+Expected configuration is Redis 5+ with `appendonly=yes` and `appendfsync=always`.
+
+## Start the worker and API
+
+Start each process in its own PowerShell terminal from the repository root, with the virtual environment activated and the same `REDIS_URL` configured.
+
+**Terminal 1 — worker:**
 
 ```powershell
+.\.venv\Scripts\Activate.ps1
+$env:REDIS_URL = 'redis://127.0.0.1:6380/0'
+python -m app.worker
+```
+
+**Terminal 2 — API:**
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+$env:REDIS_URL = 'redis://127.0.0.1:6380/0'
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+Omit or change the `REDIS_URL` override when `.env` already points to the correct Redis server. Check readiness and interactive API documentation at:
+
+- Health: `http://127.0.0.1:8000/health`
+- OpenAPI UI: `http://127.0.0.1:8000/docs`
+
+The health endpoint returns `200` only when PostgreSQL and Redis Streams are available. In a third terminal, verify end-to-end stream-to-worker persistence:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+$env:REDIS_URL = 'redis://127.0.0.1:6380/0'
 python -m app.smoke_test
 ```
 
-Run local tests with `python -m pytest`. PostgreSQL-backed tests use the configured database and remove only their own generated rows. The smoke test leaves its uniquely identified reading in the database as evidence of successful processing. Readings are limited to six fractional value digits, timestamps more than five minutes ahead are rejected, and the initial batch API limit is 500 items.
+## Tests and implemented APIs
 
-## Implemented API
+PostgreSQL-backed tests use the configured database and clean up their own test rows:
 
-- `POST /api/v1/readings` and `POST /api/v1/readings/batch`
+```powershell
+python -m pytest -q
+```
+
+The implemented API includes:
+
+- `POST /api/v1/readings` and partial-success `POST /api/v1/readings/batch` (maximum 500 per request)
 - `POST /api/v1/rules` and `GET /api/v1/rules`
 - `GET /api/v1/alerts`, `GET /api/v1/alerts/{alertId}`, acknowledge, and resolve
 - `GET /health`
 
-Rule creation supports all five comparison operators and optional rolling average windows. The worker evaluates a reading and persists its alert in the same transaction; it acknowledges stream events only after that transaction commits.
+Rule creation supports all five comparison operators and optional rolling event-time average windows. The worker persists the reading and evaluates matching rules in the same PostgreSQL transaction, then acknowledges the stream event. Rule edit/enable/disable routes are not implemented yet.
 
-## Simulator and load test
+## Sensor simulator
 
-Generate reproducible individual or batch traffic with deliberate threshold breaches:
-
-```powershell
-python -m app.simulator --sensors 100 --types temperature,humidity --rate 100 --duration 10 --mode batch --batch-size 25 --breach-every 10 --seed 1
-```
-
-Run a basic Locust test:
+Generate reproducible individual or batch traffic with deliberate threshold breaches. This example schedules 1,000 readings/sec for 10 seconds in 25-reading batches and reports attempted, accepted, duplicate, rejected, failed, request latency, and observed throughput:
 
 ```powershell
-python -m locust -f locustfile.py --headless -H http://127.0.0.1:8000 -u 100 -r 20 -t 30s
+python -m app.simulator --base-url http://127.0.0.1:8000 --sensors 100 --types temperature,humidity --rate 1000 --duration 10 --mode batch --batch-size 25 --breach-every 10 --seed 1 --workers 32
 ```
 
-Set `BATCH_SIZE`, `SENSOR_COUNT`, `METRIC_TYPE`, or `BREACH_EVERY` in the environment to change the Locust request shape. A burst target run can be attempted with `-u 1000 -r 1000 -t 10s`; report actual achieved throughput and errors rather than treating the configured rate as a result.
+The simulator's accepted readings/sec is computed from accepted item outcomes and the measured interval between the first request start and last request completion. Request throughput is the number of HTTP calls/sec; with batch requests, it is not the same as readings/sec.
 
-Rule editing and enable/disable APIs remain future work. The actual end-to-end Redis Streams smoke test and load tests require a compatible Redis 5+ server.
+## Load tests
+
+Run a configurable Locust batch-ingestion test for a sustained sample:
+
+```powershell
+$env:REDIS_URL = 'redis://127.0.0.1:6380/0'
+$env:BATCH_SIZE = '25'
+$env:SENSOR_COUNT = '100'
+$env:METRIC_TYPE = 'temperature'
+$env:BREACH_EVERY = '10'
+python -m locust -f locustfile.py --headless -H http://127.0.0.1:8000 -u 100 -r 20 -t 30s --only-summary
+```
+
+Locust reports HTTP requests/sec and request-latency percentiles. Multiply request throughput by batch size only when all items are accepted; inspect per-item outcomes and persisted database counts to establish actual readings/sec. A configured user count or spawn rate is not an achieved throughput result.
+
+For the controlled **10,000 readings / one-second burst** measurement, use the simulator's 500-item batches (20 concurrent HTTP requests). This command creates a dedicated metric type and schedules exactly 10,000 readings for the burst; select an unused metric type/rule combination before running:
+
+```powershell
+$env:REDIS_URL = 'redis://127.0.0.1:6380/0'
+python -m app.simulator --base-url http://127.0.0.1:8000 --sensors 1 --types load-test --rate 10000 --duration 1 --mode batch --batch-size 500 --breach-every 10 --seed 2026 --workers 20
+```
+
+The report in `docs/load-test-report.md` records the measured burst, API acceptance counts, worker persistence/rule correctness, and limitations. A burst target is met only if 10,000 readings are accepted within one measured second with no rejected/failed readings; a later worker backlog does not count as API ingestion throughput, so verify persistence separately.

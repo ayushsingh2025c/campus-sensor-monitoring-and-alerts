@@ -11,6 +11,17 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 
+def _percentile(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * percentile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
 def generate_readings(
     count: int,
     *,
@@ -38,7 +49,7 @@ def _chunks(items: list[dict[str, Any]], size: int) -> list[list[dict[str, Any]]
     return [items[start : start + size] for start in range(0, len(items), size)]
 
 
-def _submit(base_url: str, items: list[dict[str, Any]], mode: str, scheduled_at: float) -> dict[str, int]:
+def _submit(base_url: str, items: list[dict[str, Any]], mode: str, scheduled_at: float) -> dict[str, Any]:
     delay = scheduled_at - time.monotonic()
     if delay > 0:
         time.sleep(delay)
@@ -50,26 +61,51 @@ def _submit(base_url: str, items: list[dict[str, Any]], mode: str, scheduled_at:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    started_at = time.monotonic()
     try:
         with urlopen(request, timeout=30) as response:
             result = json.loads(response.read())
             if mode == "individual":
                 key = "duplicate" if result.get("status") == "duplicate" else "accepted"
-                return {key: 1}
-            counts = {"accepted": 0, "duplicate": 0, "rejected": 0}
-            for outcome in result.get("results", []):
-                counts[outcome.get("status", "rejected")] += 1
-            return counts
+                counts = {"accepted": 0, "duplicate": 0, "rejected": 0}
+                counts[key] = 1
+            else:
+                counts = {"accepted": 0, "duplicate": 0, "rejected": 0}
+                for outcome in result.get("results", []):
+                    counts[outcome.get("status", "rejected")] += 1
+            return {
+                **counts,
+                "http_failures": 0,
+                "failed_readings": 0,
+                "latency_ms": (time.monotonic() - started_at) * 1000,
+                "request_started_at": started_at,
+                "request_finished_at": time.monotonic(),
+            }
     except HTTPError as exc:
-        if exc.code == 207:
+        if exc.code == 207 and mode == "batch":
             result = json.loads(exc.read())
             counts = {"accepted": 0, "duplicate": 0, "rejected": 0}
             for outcome in result.get("results", []):
                 counts[outcome.get("status", "rejected")] += 1
-            return counts
-        return {"failed": len(items)}
+            http_failures = 0
+            failed_readings = 0
+        else:
+            counts = {"accepted": 0, "duplicate": 0, "rejected": 0}
+            http_failures = 1
+            failed_readings = len(items)
     except (TimeoutError, URLError, OSError, json.JSONDecodeError):
-        return {"failed": len(items)}
+        counts = {"accepted": 0, "duplicate": 0, "rejected": 0}
+        http_failures = 0
+        failed_readings = len(items)
+    finished_at = time.monotonic()
+    return {
+        **counts,
+        "http_failures": http_failures,
+        "failed_readings": failed_readings,
+        "latency_ms": (finished_at - started_at) * 1000,
+        "request_started_at": started_at,
+        "request_finished_at": finished_at,
+    }
 
 
 def main() -> None:
@@ -104,7 +140,17 @@ def main() -> None:
     chunk_size = 1 if args.mode == "individual" else args.batch_size
     jobs = _chunks(readings, chunk_size)
     started = time.monotonic()
-    counts = {"attempted": target_count, "accepted": 0, "duplicate": 0, "rejected": 0, "failed": 0}
+    counts = {
+        "attempted": target_count,
+        "accepted": 0,
+        "duplicate": 0,
+        "rejected": 0,
+        "http_failures": 0,
+        "failed_readings": 0,
+    }
+    request_latencies: list[float] = []
+    request_started: list[float] = []
+    request_finished: list[float] = []
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = [
             executor.submit(
@@ -117,10 +163,34 @@ def main() -> None:
             for index, items in enumerate(jobs)
         ]
         for future in as_completed(futures):
-            for key, value in future.result().items():
-                counts[key] = counts.get(key, 0) + value
+            result = future.result()
+            request_latencies.append(result.pop("latency_ms"))
+            request_started.append(result.pop("request_started_at"))
+            request_finished.append(result.pop("request_finished_at"))
+            for key, value in result.items():
+                if key in {"accepted", "duplicate", "rejected", "http_failures", "failed_readings"}:
+                    counts[key] += value
     elapsed = time.monotonic() - started
-    print(json.dumps({**counts, "elapsed_seconds": round(elapsed, 3), "achieved_readings_per_second": round(target_count / elapsed, 2)}, indent=2))
+    burst_seconds = (
+        max(request_finished) - min(request_started)
+        if request_started and request_finished
+        else 0
+    )
+    result = {
+        **counts,
+        "requests": len(jobs),
+        "batch_size": chunk_size,
+        "mode": args.mode,
+        "run_elapsed_seconds": round(elapsed, 3),
+        "measured_burst_seconds": round(burst_seconds, 3),
+        "accepted_readings_per_second": round(counts["accepted"] / burst_seconds, 2) if burst_seconds else 0,
+        "request_latency_ms": {
+            "p50": round(_percentile(request_latencies, 0.50), 2) if request_latencies else None,
+            "p95": round(_percentile(request_latencies, 0.95), 2) if request_latencies else None,
+            "max": round(max(request_latencies), 2) if request_latencies else None,
+        },
+    }
+    print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":
