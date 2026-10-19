@@ -49,6 +49,19 @@ def _chunks(items: list[dict[str, Any]], size: int) -> list[list[dict[str, Any]]
     return [items[start : start + size] for start in range(0, len(items), size)]
 
 
+def _scheduled_times(
+    started_at: float,
+    job_count: int,
+    chunk_size: int,
+    rate: float,
+    *,
+    burst: bool,
+) -> list[float]:
+    if burst:
+        return [started_at] * job_count
+    return [started_at + index * chunk_size / rate for index in range(job_count)]
+
+
 def _submit(base_url: str, items: list[dict[str, Any]], mode: str, scheduled_at: float) -> dict[str, Any]:
     delay = scheduled_at - time.monotonic()
     if delay > 0:
@@ -117,6 +130,11 @@ def main() -> None:
     parser.add_argument("--duration", type=float, default=10, help="Run duration in seconds")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--mode", choices=("individual", "batch"), default="individual")
+    parser.add_argument(
+        "--burst",
+        action="store_true",
+        help="start all generated requests immediately instead of pacing them across the duration",
+    )
     parser.add_argument("--breach-every", type=int, default=10, help="Set every Nth reading to 100; 0 disables")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--workers", type=int, default=32)
@@ -151,6 +169,7 @@ def main() -> None:
     request_latencies: list[float] = []
     request_started: list[float] = []
     request_finished: list[float] = []
+    scheduled_times = _scheduled_times(started, len(jobs), chunk_size, args.rate, burst=args.burst)
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = [
             executor.submit(
@@ -158,7 +177,7 @@ def main() -> None:
                 args.base_url,
                 items,
                 args.mode,
-                started + index * chunk_size / args.rate,
+                scheduled_times[index],
             )
             for index, items in enumerate(jobs)
         ]
@@ -181,6 +200,7 @@ def main() -> None:
         "requests": len(jobs),
         "batch_size": chunk_size,
         "mode": args.mode,
+        "schedule_mode": "burst" if args.burst else "paced",
         "run_elapsed_seconds": round(elapsed, 3),
         "measured_burst_seconds": round(burst_seconds, 3),
         "accepted_readings_per_second": round(counts["accepted"] / burst_seconds, 2) if burst_seconds else 0,

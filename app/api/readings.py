@@ -4,13 +4,14 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import ValidationError
 from redis.exceptions import RedisError
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.events import ReadingEvent
 from app.models import Reading
 from app.schemas import BatchReadingResponse, BatchReadings, ReadingOutcome
-from app.streams import EventIdentityConflict, publish_reading
+from app.streams import EventIdentityConflict, publish_reading, publish_readings
 
 logger = logging.getLogger("campus.api.readings")
 router = APIRouter(prefix="/readings", tags=["readings"])
@@ -131,12 +132,69 @@ def ingest_batch(batch: BatchReadings, db: Session = Depends(get_db)) -> BatchRe
             detail={"code": "batch_too_large", "message": f"Batch cannot exceed {MAX_BATCH_SIZE} readings"},
         )
 
-    outcomes: list[ReadingOutcome] = []
+    outcomes: list[ReadingOutcome | None] = [None] * len(batch.readings)
+    events: list[tuple[int, ReadingEvent]] = []
     for index, item in enumerate(batch.readings):
         try:
             event = ReadingEvent.model_validate(item)
         except ValidationError as exc:
-            outcomes.append(_validation_outcome(index, exc))
+            outcomes[index] = _validation_outcome(index, exc)
             continue
-        outcomes.append(_enqueue(event, index, db, fail_http=False))
-    return BatchReadingResponse(results=outcomes)
+        events.append((index, event))
+
+    existing = (
+        {
+            reading.event_id: reading
+            for reading in db.scalars(
+                select(Reading).where(Reading.event_id.in_([event.event_id for _, event in events]))
+            ).all()
+        }
+        if events
+        else {}
+    )
+    publish: list[tuple[int, ReadingEvent]] = []
+    for index, event in events:
+        stored = existing.get(event.event_id)
+        if stored is None:
+            publish.append((index, event))
+        elif _same_reading(stored, event):
+            outcomes[index] = ReadingOutcome(index=index, eventId=event.event_id, status="duplicate")
+        else:
+            outcomes[index] = ReadingOutcome(
+                index=index,
+                eventId=event.event_id,
+                status="rejected",
+                error={"code": "event_id_conflict", "message": "eventId was used for different reading data"},
+            )
+
+    if publish:
+        try:
+            results = publish_readings([event for _, event in publish])
+        except RedisError as exc:
+            logger.warning("Redis Streams batch publish failed: %s", type(exc).__name__)
+            for index, event in publish:
+                outcomes[index] = ReadingOutcome(
+                    index=index,
+                    eventId=event.event_id,
+                    status="rejected",
+                    error={
+                        "code": "stream_unavailable",
+                        "message": "Reading was not accepted because the event stream is unavailable",
+                    },
+                )
+        else:
+            for (index, event), (result, _) in zip(publish, results, strict=True):
+                if result == "conflict":
+                    outcomes[index] = ReadingOutcome(
+                        index=index,
+                        eventId=event.event_id,
+                        status="rejected",
+                        error={
+                            "code": "event_id_conflict",
+                            "message": "eventId was used for different reading data",
+                        },
+                    )
+                else:
+                    outcomes[index] = ReadingOutcome(index=index, eventId=event.event_id, status=result)
+
+    return BatchReadingResponse(results=[outcome for outcome in outcomes if outcome is not None])

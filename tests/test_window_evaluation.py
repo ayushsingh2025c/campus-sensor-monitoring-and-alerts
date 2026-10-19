@@ -5,7 +5,7 @@ from sqlalchemy import select
 
 from app.events import ReadingEvent
 from app.models import Alert, AlertRule, Reading
-from app.worker import persist_reading
+from app.worker import persist_reading, persist_readings
 
 
 def create_window_rule(
@@ -143,6 +143,30 @@ def test_late_out_of_order_reading_inside_window_contributes_to_average(
     assert len(alerts) == 1
     for alert in alerts:
         cleanup_rows(alert=alert.id)
+
+
+def test_batch_window_evaluation_preserves_arrival_and_event_time_order(
+    client, db_session, cleanup_rows
+):
+    rule_id = create_window_rule(
+        client,
+        cleanup_rows,
+        window_seconds=60,
+        threshold=60,
+        sensor_id="window-test-sensor",
+        metric_type="window-test-metric",
+    )
+    now = datetime.now(UTC)
+    newer = make_event(20, now)
+    late = make_event(80, now - timedelta(seconds=30))
+    cleanup_rows(reading=newer.event_id)
+    cleanup_rows(reading=late.event_id)
+
+    assert persist_readings([newer, late], db_session) == [True, True]
+
+    alerts = db_session.scalars(select(Alert).where(Alert.rule_id == rule_id)).all()
+    assert len(alerts) == 1
+    cleanup_rows(alert=alerts[0].id)
 
 
 def test_readings_older_than_window_do_not_affect_rolling_average(

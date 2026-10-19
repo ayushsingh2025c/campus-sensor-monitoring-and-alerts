@@ -149,11 +149,23 @@ python -m locust -f locustfile.py --headless -H http://127.0.0.1:8000 -u 100 -r 
 
 Locust reports HTTP requests/sec and request-latency percentiles. Multiply request throughput by batch size only when all items are accepted; inspect per-item outcomes and persisted database counts to establish actual readings/sec. A configured user count or spawn rate is not an achieved throughput result.
 
-For the controlled **10,000 readings / one-second burst** measurement, use the simulator's 500-item batches (20 concurrent HTTP requests). This command creates a dedicated metric type and schedules exactly 10,000 readings for the burst; select an unused metric type/rule combination before running:
+For the controlled **10,000 readings / one-second burst** measurement, use the simulator's 500-item batches (20 concurrent HTTP requests). First create an alert rule for a unique metric type so worker-side rule evaluation is included; select an unused metric type:
 
 ```powershell
+$metricType = 'load-test-unique'
+$rule = @{
+    name = 'Load test threshold'
+    sensorId = 'sim-00000'
+    type = $metricType
+    operator = '>'
+    threshold = 30
+    windowSeconds = 60
+    aggregation = 'average'
+    enabled = $true
+} | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8000/api/v1/rules' -ContentType 'application/json' -Body $rule
 $env:REDIS_URL = 'redis://127.0.0.1:6380/0'
-python -m app.simulator --base-url http://127.0.0.1:8000 --sensors 1 --types load-test --rate 10000 --duration 1 --mode batch --batch-size 500 --breach-every 10 --seed 2026 --workers 20
+python -m app.simulator --base-url http://127.0.0.1:8000 --sensors 1 --types $metricType --rate 10000 --duration 1 --mode batch --batch-size 500 --breach-every 1 --seed 2026 --workers 20 --burst
 ```
 
-The report in `docs/load-test-report.md` records the measured burst, API acceptance counts, worker persistence/rule correctness, and limitations. A burst target is met only if 10,000 readings are accepted within one measured second with no rejected/failed readings; a later worker backlog does not count as API ingestion throughput, so verify persistence separately.
+`--burst` releases the 20 requests immediately rather than pacing them across one second. The simulator reports accepted sensor readings/sec from the measured first-request-start to last-response-completion interval; HTTP request throughput is not the same metric. Verify PostgreSQL contains 10,000 distinct event IDs, the expected single active alert exists, and the Redis consumer group has no pending messages. The report in `docs/load-test-report.md` records the measured baseline and optimized runs: the latest immediate burst achieved 9,995.82 readings/sec (approximately 1.000418 seconds), so the one-second target was not met.

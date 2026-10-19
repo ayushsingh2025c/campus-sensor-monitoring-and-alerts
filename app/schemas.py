@@ -14,7 +14,7 @@ AlertStatus = Literal["OPEN", "ACKNOWLEDGED", "RESOLVED"]
 class BatchReadings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    readings: Annotated[list[dict[str, object]], Field(min_length=1)]
+    readings: Annotated[list[object], Field(min_length=1)]
 
 
 class ErrorDetail(BaseModel):

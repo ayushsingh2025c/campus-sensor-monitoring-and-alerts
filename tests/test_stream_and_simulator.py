@@ -5,8 +5,8 @@ import pytest
 
 from app.events import ReadingEvent
 from app import simulator
-from app.simulator import _percentile, _submit, generate_readings
-from app.streams import EventIdentityConflict, publish_reading, redis_streams_supported
+from app.simulator import _percentile, _scheduled_times, _submit, generate_readings
+from app.streams import EventIdentityConflict, publish_reading, publish_readings, redis_streams_supported
 
 
 def test_simulator_is_reproducible_and_generates_requested_breaches():
@@ -67,6 +67,11 @@ def test_simulator_percentiles_interpolate_between_samples():
     assert _percentile([], 0.95) is None
 
 
+def test_simulator_burst_schedules_all_batches_immediately():
+    assert _scheduled_times(10, 4, 500, 10_000, burst=True) == [10, 10, 10, 10]
+    assert _scheduled_times(10, 4, 500, 10_000, burst=False) == [10, 10.05, 10.1, 10.15]
+
+
 @pytest.mark.parametrize(("version", "supported"), [("3.0.504", False), ("5.0.14", True), ("7.2.4", True)])
 def test_stream_health_requires_redis_streams(version, supported):
     class RedisStub:
@@ -102,3 +107,29 @@ def test_publish_reading_uses_atomic_stream_idempotency_result():
     client.result = ["conflict", ""]
     with pytest.raises(EventIdentityConflict, match="already used"):
         publish_reading(event, client)
+
+
+def test_publish_readings_batches_atomic_idempotency_outcomes():
+    events = [
+        ReadingEvent(
+            eventId=uuid4(),
+            sensorId="stream-batch-test",
+            type="temperature",
+            value=value,
+            timestamp=datetime.now(UTC),
+        )
+        for value in (20, 21, 22)
+    ]
+
+    class RedisStub:
+        def eval(self, script, key_count, *_args):
+            assert "for index = 1, #ARGV, 2 do" in script
+            assert "XADD" in script
+            assert key_count == 2
+            return [["accepted", "1-0"], ["duplicate", ""], ["conflict", ""]]
+
+    assert publish_readings(events, RedisStub()) == [
+        ("accepted", "1-0"),
+        ("duplicate", ""),
+        ("conflict", ""),
+    ]
